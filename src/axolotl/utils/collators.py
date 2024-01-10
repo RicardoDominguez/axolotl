@@ -122,6 +122,10 @@ class DataCollatorForSeq2Seq:
             )
             features["decoder_input_ids"] = decoder_input_ids
 
+        print(features['input_ids'].shape)
+        print(features['attention_mask'].shape)
+        print(features['labels'].shape)
+        # print(features['position_ids'].shape)
         return features
 
 
@@ -130,26 +134,44 @@ class BatchSamplerDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
     """
     Collator for multipack specific to the using the BatchSampler
     """
+    def __init__(self, tokenizer, max_length, **kwargs):
+        super().__init__(tokenizer, max_length=max_length, **kwargs)
 
     def __call__(self, features, return_tensors=None):
-        chunked_data = {}
-        for feature in features[0].keys():
-            if feature == "length":
-                continue
-            if feature == "attention_mask":
-                arrays = [
-                    (1) * np.array(item[feature])
-                    for item in features
-                    if feature in item
-                ]
-                chunked_data[feature] = np.concatenate(arrays)
-            else:
-                arrays = [
-                    np.array(item[feature]) for item in features if feature in item
-                ]
-                chunked_data[feature] = np.concatenate(arrays)
-        features = [chunked_data]
-        return super().__call__(features, return_tensors=return_tensors)
+        # use 'input_ids' to reconstruct the batches from the flattened features
+        batch_ids = [[]]
+        batch_l = 0
+        for idx, item in enumerate(features):
+            l = len(item['input_ids'])
+            if batch_l + l > self.max_length:
+                batch_ids.append([])
+                batch_l = 0
+            
+            batch_ids[-1].append(idx)
+            batch_l += l
+
+        batches = []
+        for ids in batch_ids:
+            batch_features = [features[idx] for idx in ids]
+            chunked_data = {}
+            for feature in batch_features[0].keys():
+                if feature == "length":
+                    continue
+                if feature == "attention_mask":
+                    arrays = [
+                        (1) * np.array(item[feature])
+                        for item in batch_features
+                        if feature in item
+                    ]
+                    chunked_data[feature] = np.concatenate(arrays)
+                else:
+                    arrays = [
+                        np.array(item[feature]) for item in batch_features if feature in item
+                    ]
+                    chunked_data[feature] = np.concatenate(arrays)
+            batches.append(chunked_data)
+
+        return super().__call__(batches, return_tensors=return_tensors)
 
 
 @dataclass

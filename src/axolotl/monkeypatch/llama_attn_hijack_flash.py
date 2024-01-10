@@ -600,6 +600,7 @@ def llama_model_forward(
         position_ids = position_ids.unsqueeze(0).view(-1, seq_length)
     else:
         position_ids = position_ids.view(-1, seq_length).long()
+        print(position_ids.shape)
         cu_seqlens, max_seqlen = get_cu_seqlens_from_pos_ids(position_ids)
         cu_seqlens = cu_seqlens.squeeze()
 

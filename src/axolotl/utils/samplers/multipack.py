@@ -117,7 +117,7 @@ class MultipackBatchSampler(BatchSampler):
         packing_efficiency_estimate: float = 1.0,
     ):
         super().__init__(sampler, batch_size, drop_last)
-        self.batch_size = None
+        # self.batch_size = None
         self.batch_max_len = batch_max_len
         self.lengths: np.ndarray = lengths
         self.packing_efficiency_estimate = packing_efficiency_estimate or 1.0
@@ -158,7 +158,12 @@ class MultipackBatchSampler(BatchSampler):
 
     def __iter__(self):
         batches = self.generate_batches(set_stats=True)
-        return iter(batches)
+        n_iters = len(batches) / self.batch_size
+        n_iters = math.floor(n_iters) if self.drop_last else math.ceil(n_iters)
+        for i in range(n_iters):
+            batch = batches[i * self.batch_size : (i + 1) * self.batch_size]
+            flat_batch = [item for elem in batch for item in elem]
+            yield flat_batch
 
     def num_batches(self):
         batches = self.generate_batches(set_stats=True)

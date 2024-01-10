@@ -888,7 +888,7 @@ def encode_packed_pretraining(
         RandomSampler(train_dataset),
         batch_size=batch_size,
         drop_last=True,
-        batch_max_len=batch_size * max_seq_length,
+        batch_max_len=max_seq_length,
         lengths=get_dataset_lengths(train_dataset),
     )
 

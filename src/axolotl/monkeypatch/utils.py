@@ -100,6 +100,8 @@ def get_cu_seqlens_from_pos_ids(position_ids):
         results.append(cu_seqlens)
         max_seq_lens.append(max_seq_len)
 
+    print("res shape", [res.shape for res in results])
+    print(results)
     return torch.stack(results).to(dtype=torch.int32), torch.stack(max_seq_lens)
 
 

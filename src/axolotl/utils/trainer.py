@@ -214,8 +214,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 sampler=RandomSampler(train_dataset),
                 batch_size=cfg.micro_batch_size,
                 drop_last=True,
-                batch_max_len=cfg.micro_batch_size
-                * (cfg.max_packed_sequence_len or cfg.sequence_len),
+                batch_max_len=(cfg.max_packed_sequence_len or cfg.sequence_len),
                 lengths=get_dataset_lengths(train_dataset),
             )
 

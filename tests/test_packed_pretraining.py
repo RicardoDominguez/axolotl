@@ -33,6 +33,7 @@ class TestPacking(unittest.TestCase):
 
         collate_fn = PretrainingBatchSamplerDataCollatorForSeq2Seq(
             self.tokenizer,
+            max_length=self.max_seq_length,
             return_tensors="pt",
             padding=True,
             pad_to_multiple_of=self.max_seq_length,

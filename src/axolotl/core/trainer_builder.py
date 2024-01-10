@@ -81,7 +81,7 @@ class AxolotlTrainingArguments(TrainingArguments):
     )
     sample_packing_efficiency: float = field(
         default=1.0,
-        metadata={"help": "Sample packing efficiency for calculating batch length."},
+        metadata={"help": "Sample packing efficiency for calculating number of batches."},
     )
     max_seq_length: int = field(
         default=2048,
@@ -197,7 +197,7 @@ class AxolotlTrainer(Trainer):
                 RandomSampler(self.train_dataset),
                 self.args.train_batch_size,
                 drop_last=True,
-                batch_max_len=self._train_batch_size * self.args.max_seq_length,
+                batch_max_len=self.args.max_seq_length,
                 lengths=get_dataset_lengths(self.train_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
             )
@@ -211,7 +211,7 @@ class AxolotlTrainer(Trainer):
                 SequentialSampler(eval_dataset),
                 self.args.per_device_eval_batch_size,
                 drop_last=True,
-                batch_max_len=self.args.eval_batch_size * self.args.max_seq_length,
+                batch_max_len=self.args.max_seq_length,
                 lengths=get_dataset_lengths(eval_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
             )
@@ -897,8 +897,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             use_batch_sampler_collator = True
 
         if use_batch_sampler_collator:
+            print(kwargs)
             return BatchSamplerDataCollatorForSeq2Seq(
                 self.tokenizer,
+                max_length=self.cfg.sequence_len,
                 return_tensors="pt",
                 **kwargs,
             )
