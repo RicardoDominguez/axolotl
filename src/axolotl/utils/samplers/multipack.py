@@ -193,6 +193,7 @@ class MultipackBatchSampler(BatchSampler):
                 * math.floor(
                     0.99
                     * lengths_sum_per_device
+                    / self.batch_size
                     / self.packing_efficiency_estimate
                     // self.batch_max_len
                 )
