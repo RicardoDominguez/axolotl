@@ -100,8 +100,20 @@ def get_cu_seqlens_from_pos_ids(position_ids):
         results.append(cu_seqlens)
         max_seq_lens.append(max_seq_len)
 
-    print("res shape", [res.shape for res in results])
-    print(results)
+    # hacky: pad with last value to make sure all sequences are the same length
+    max_len = max([len(res) for res in results])
+    for i in range(len(results)):
+        results[i] = torch.cat(
+            [
+                results[i],
+                torch.tensor(
+                    [results[i][-1].item()], dtype=torch.int32, device=device
+                ).repeat(max_len - results[i].shape[0]),
+            ]
+        )
+    
+    # print("res shape", [res.shape for res in results])
+    # print(results)
     return torch.stack(results).to(dtype=torch.int32), torch.stack(max_seq_lens)
 
 
