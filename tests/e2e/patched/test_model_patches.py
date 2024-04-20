@@ -22,7 +22,7 @@ class TestModelPatches(unittest.TestCase):
         cfg = DictDefault(
             {
                 "base_model": "hf-internal-testing/Mixtral-tiny",
-                "tokenizer_config": "mistralai/Mixtral-8x7B-v0.1",
+                "tokenizer_config": "LoneStriker/Mixtral-8x7B-v0.1-HF",
                 "flash_attention": True,
                 "sample_packing": True,
                 "sequence_len": 2048,
@@ -52,11 +52,7 @@ class TestModelPatches(unittest.TestCase):
         model, _ = load_model(cfg, tokenizer, inference=cli_args.inference)
 
         assert (
-            "axolotl.monkeypatch.mixtral.modeling_mixtral"
-            in model.model.layers[0].self_attn.__class__.__module__
-        )
-        assert (
-            "MixtralMultipackFlashAttention2"
+            "MixtralFlashAttention2"
             in model.model.layers[0].self_attn.__class__.__name__
         )
 

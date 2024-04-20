@@ -5,25 +5,38 @@ Builder for the training args and trainer
 
 import abc
 import importlib
+import importlib.util
 import logging
 import math
 import sys
 from abc import abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Literal, Optional, Type, Union
 
 import torch
 import transformers
 from datasets import Dataset
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.utils.data import BatchSampler, DataLoader, RandomSampler, SequentialSampler
-from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+from transformers import (
+    EarlyStoppingCallback,
+    PreTrainedModel,
+    Trainer,
+    TrainerCallback,
+    TrainingArguments,
+)
 from transformers.trainer_utils import seed_worker
-from trl import DPOTrainer
+from transformers.utils import is_sagemaker_mp_enabled
+from trl import DPOTrainer, ORPOConfig, ORPOTrainer
+from trl.trainer.utils import pad_to_length
 
+from axolotl.loraplus import create_loraplus_optimizer
+from axolotl.monkeypatch.multipack import SUPPORTED_MULTIPACK_MODEL_TYPES
 from axolotl.monkeypatch.relora import ReLoRACallback, ReLoRAScheduler
+from axolotl.utils import is_mlflow_available
 from axolotl.utils.callbacks import (
     EvalFirstStepCallback,
     GPUStatsCallback,
@@ -31,20 +44,27 @@ from axolotl.utils.callbacks import (
     SaveAxolotlConfigtoWandBCallback,
     SaveBetterTransformerModelCallback,
     bench_eval_callback_factory,
+    causal_lm_bench_eval_callback_factory,
     log_prediction_callback_factory,
 )
+from axolotl.utils.callbacks.lisa import lisa_callback_factory
 from axolotl.utils.collators import (
     ConcatenateCollators,
     BatchSamplerDataCollatorForSeq2Seq,
     DataCollatorForSeq2Seq,
     MissingFeaturesCollator,
     MambaDataCollator,
+    V2BatchSamplerDataCollatorForSeq2Seq,
 )
 from axolotl.utils.samplers import MultipackBatchSampler, get_dataset_lengths
 from axolotl.utils.schedulers import (
     get_cosine_schedule_with_min_lr,
     get_cosine_schedule_with_quadratic_warmup,
+    get_cosine_schedule_with_warmup_decay_constant,
 )
+
+if is_sagemaker_mp_enabled():
+    import smdistributed.modelparallel.torch as smp
 
 try:
     import torch._dynamo  # pylint: disable=ungrouped-imports
@@ -52,6 +72,22 @@ except ImportError:
     pass
 
 LOG = logging.getLogger("axolotl.core.trainer_builder")
+
+
+def _sanitize_kwargs_for_tagging(tag_names, kwargs=None):
+    if isinstance(tag_names, str):
+        tag_names = [tag_names]
+
+    if kwargs is not None:
+        if "tags" not in kwargs:
+            kwargs["tags"] = tag_names
+        elif "tags" in kwargs and isinstance(kwargs["tags"], list):
+            kwargs["tags"].extend(tag_names)
+        elif "tags" in kwargs and isinstance(kwargs["tags"], str):
+            tag_names.append(kwargs["tags"])
+            kwargs["tags"] = tag_names
+
+    return kwargs
 
 
 @dataclass
@@ -77,6 +113,10 @@ class AxolotlTrainingArguments(TrainingArguments):
         default=False,
         metadata={"help": "Use sample packing for efficient training."},
     )
+    multipack_real_batches: bool = field(
+        default=False,
+        metadata={"help": "Use real batches for efficient training."},
+    )
     eval_sample_packing: Optional[bool] = field(
         default=None,
         metadata={"help": "Use sample packing for efficient evals."},
@@ -101,6 +141,14 @@ class AxolotlTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "how many warmup steps to take after reset for ReLoRA"},
     )
+    relora_anneal_steps: Optional[int] = field(
+        default=None,
+        metadata={"help": "how many warmup steps to take after reset for ReLoRA"},
+    )
+    relora_prune_ratio: Optional[float] = field(
+        default=0.9,
+        metadata={"help": "prune ratio for magnitude pruning of the optimizer"},
+    )
     bench_split: Optional[str] = field(
         default="eval", metadata={"help": "The benchmark split to run on"}
     )
@@ -112,6 +160,9 @@ class AxolotlTrainingArguments(TrainingArguments):
     )
     do_bench_eval: Optional[bool] = field(
         default=False, metadata={"help": "Whether to run the Benchmark evaluation."}
+    )
+    do_causal_lm_eval: Optional[bool] = field(
+        default=False, metadata={"help": "Whether to run the Causal LM evaluation."}
     )
     max_bench_samples: Optional[int] = field(
         default=None,
@@ -130,6 +181,38 @@ class AxolotlTrainingArguments(TrainingArguments):
         default=None,
         metadata={"help": "Minimum learning rate is min_lr_ratio * learning_rate"},
     )
+    cosine_constant_lr_ratio: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Starting constant learning rate step is cosine_constant_lr_ratio * max_steps"
+        },
+    )
+    loraplus_lr_ratio: Optional[float] = field(
+        default=None, metadata={"help": "loraplus learning rate ratio lr_B / lr_A."}
+    )
+    loraplus_lr_embedding: Optional[float] = field(
+        default=1e-6,
+        metadata={"help": "loraplus learning rate for lora embedding layers."},
+    )
+    qlora: bool = field(
+        default=False,
+        metadata={"help": "whether this is a qlora training"},
+    )
+    orpo_alpha: Optional[float] = field(
+        default=None,
+    )
+    lisa_n_layers: Optional[int] = field(
+        default=None,
+        metadata={"help": "the number of activate layers in LISA"},
+    )
+    lisa_step_interval: Optional[int] = field(
+        default=None,
+        metadata={"help": "how often to switch layers in LISA"},
+    )
+    lisa_layers_attribute: Optional[str] = field(
+        default=None,
+        metadata={"help": "path under the model to access the layers"},
+    )
 
 
 class AxolotlTrainer(Trainer):
@@ -146,13 +229,44 @@ class AxolotlTrainer(Trainer):
         num_epochs=1,
         bench_data_collator=None,
         eval_data_collator=None,
-        **kwargs
+        **kwargs,
     ):
         self.num_epochs = num_epochs
         self.bench_data_collator = bench_data_collator
         self.eval_data_collator = eval_data_collator
         super().__init__(*_args, **kwargs)
         self.train_data_collator = self.data_collator
+        self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        if self.args.orpo_alpha:
+            self.loss_fct = torch.nn.CrossEntropyLoss(reduction="none")
+
+    def create_optimizer(self):
+        if self.args.loraplus_lr_ratio is None:
+            return super().create_optimizer()
+
+        opt_model = self.model_wrapped if is_sagemaker_mp_enabled() else self.model
+        if self.optimizer is None:  # pylint: disable=access-member-before-definition
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(
+                self.args,
+                opt_model,
+            )
+
+            loraplus_lr_ratio = getattr(self.args, "loraplus_lr_ratio", None)
+            loraplus_lr_embedding = getattr(self.args, "loraplus_lr_embedding", None)
+            self.optimizer = create_loraplus_optimizer(  # pylint: disable=attribute-defined-outside-init
+                opt_model,
+                optimizer_cls,
+                optimizer_kwargs,
+                loraplus_lr_ratio,
+                loraplus_lr_embedding,
+            )
+
+        if is_sagemaker_mp_enabled():
+            self.optimizer = smp.DistributedOptimizer(  # pylint: disable=attribute-defined-outside-init
+                self.optimizer
+            )
+
+        return self.optimizer
 
     def create_scheduler(
         self, num_training_steps: int, optimizer: torch.optim.Optimizer = None
@@ -165,24 +279,40 @@ class AxolotlTrainer(Trainer):
             num_training_steps (int): The number of training steps to do.
             optimizer (torch.optim.Optimizer): The training optimizer
         """
+        use_cosine_quadratic = (
+            self.args.lr_scheduler_type == "cosine"
+            and self.args.lr_quadratic_warmup is True
+        )
+
+        use_cosine_min_lr = (
+            self.args.lr_scheduler_type == "cosine"
+            and self.args.cosine_min_lr_ratio is not None
+        )
 
         # fmt: off
         if self.lr_scheduler is None:  # type: ignore  # pylint: disable=access-member-before-definition
             # fmt: on
-            if (
-                self.args.lr_scheduler_type == "cosine"
-                and self.args.lr_quadratic_warmup is True
-            ):
+            if use_cosine_quadratic:
+                if use_cosine_min_lr:
+                    LOG.warning("Both cosine quadratic warmup and min lr detected. Using quadratic warmup.")
+
                 self.lr_scheduler = get_cosine_schedule_with_quadratic_warmup(  # pylint: disable=attribute-defined-outside-init
                     optimizer,
                     num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
                     num_training_steps=num_training_steps,
                 )
-            elif self.args.lr_scheduler_type == "cosine" and self.args.cosine_min_lr_ratio is not None:
+            elif self.args.cosine_min_lr_ratio and self.args.cosine_constant_lr_ratio and use_cosine_min_lr:
                 assert 0 <= self.args.cosine_min_lr_ratio <= 1.0, "cosine_min_lr_ratio must be between 0.0 and 1.0"
-                if self.args.deepspeed:
-                    LOG.warning("Using cosine scheduler with deepspeed. This may be ignored if a scheduler is set \
-                                in the deepspeed JSON")
+                assert 0 <= self.args.cosine_constant_lr_ratio <= 1.0, "cosine_constant_lr_ratio must be between 0.0 and 1.0"
+                self.lr_scheduler = get_cosine_schedule_with_warmup_decay_constant(  # pylint: disable=attribute-defined-outside-init
+                    optimizer,
+                    num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
+                    num_training_steps=num_training_steps,
+                    min_lr_ratio=self.args.cosine_min_lr_ratio,
+                    constant_lr_ratio=self.args.cosine_constant_lr_ratio,
+                )
+            elif self.args.cosine_min_lr_ratio and use_cosine_min_lr:
+                assert 0 <= self.args.cosine_min_lr_ratio <= 1.0, "cosine_min_lr_ratio must be between 0.0 and 1.0"
                 self.lr_scheduler = get_cosine_schedule_with_min_lr(  # pylint: disable=attribute-defined-outside-init
                     optimizer,
                     num_warmup_steps=self.args.get_warmup_steps(num_training_steps),
@@ -191,15 +321,30 @@ class AxolotlTrainer(Trainer):
                 )
             else:
                 return super().create_scheduler(num_training_steps, optimizer)
+        else:
+            if use_cosine_quadratic:
+                LOG.warning("axolotl's cosine scheduler with quadratic warmup not used (e.g., because of deepspeed).")
+
+            if use_cosine_min_lr:
+                LOG.warning("axolotl's cosine scheduler with min lr not used (e.g., because of deepspeed).")
+
         return self.lr_scheduler
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.args.sample_packing and not self.args.pretraining:
+            if self.args.multipack_real_batches:
+                batch_size = self.args.per_device_train_batch_size
+                batch_max_len = self.args.max_seq_length
+            else:
+                batch_size = 1
+                batch_max_len = (
+                    self.args.per_device_train_batch_size * self.args.max_seq_length
+                )
             return MultipackBatchSampler(
                 RandomSampler(self.train_dataset),
-                self.args.train_batch_size,
+                batch_size=batch_size,
                 drop_last=True,
-                batch_max_len=self._train_batch_size * self.args.max_seq_length,
+                batch_max_len=batch_max_len,
                 lengths=get_dataset_lengths(self.train_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
             )
@@ -209,11 +354,19 @@ class AxolotlTrainer(Trainer):
         self, eval_dataset: Dataset
     ) -> Optional[torch.utils.data.Sampler]:
         if self.args.sample_packing and self.args.eval_sample_packing is not False:
+            if self.args.multipack_real_batches:
+                batch_size = self.args.per_device_eval_batch_size
+                batch_max_len = self.args.max_seq_length
+            else:
+                batch_size = 1
+                batch_max_len = (
+                    self.args.per_device_eval_batch_size * self.args.max_seq_length
+                )
             return MultipackBatchSampler(
                 SequentialSampler(eval_dataset),
-                self.args.per_device_eval_batch_size,
+                batch_size=batch_size,
                 drop_last=True,
-                batch_max_len=self.args.eval_batch_size * self.args.max_seq_length,
+                batch_max_len=batch_max_len,
                 lengths=get_dataset_lengths(eval_dataset),
                 packing_efficiency_estimate=self.args.sample_packing_efficiency,
             )
@@ -222,7 +375,8 @@ class AxolotlTrainer(Trainer):
     def get_train_dataloader(self) -> DataLoader:
         if self.args.sample_packing and not self.args.pretraining:
             train_dataset = self.train_dataset
-            train_dataset = train_dataset.remove_columns(["length"])
+            if "length" in train_dataset.features.keys():
+                train_dataset = train_dataset.remove_columns(["length"])
             data_collator = self.data_collator
             dataloader_params = {
                 "batch_size": self._train_batch_size,
@@ -328,22 +482,164 @@ class AxolotlTrainer(Trainer):
         #     outputs = model(**inputs)
         #     loss = trainer_weighted_loss(outputs, labels, shift_labels=True)
         #     return (loss, outputs) if return_outputs else loss
+        if self.args.orpo_alpha:
+            return self.orpo_compute_loss(model, inputs, return_outputs=return_outputs)
         return super().compute_loss(model, inputs, return_outputs=return_outputs)
 
-    def _sanitize_kwargs_for_tagging(self, tag_names, kwargs=None):
-        if isinstance(tag_names, str):
-            tag_names = [tag_names]
+    @staticmethod
+    def orpo_concatenate_inputs(inputs, label_pad_token=-100, pad_token=0, device=None):
+        concatenated_batch = {}
 
-        if kwargs is not None:
-            if "tags" not in kwargs:
-                kwargs["tags"] = tag_names
-            elif "tags" in kwargs and isinstance(kwargs["tags"], list):
-                kwargs["tags"].extend(tag_names)
-            elif "tags" in kwargs and isinstance(kwargs["tags"], str):
-                tag_names.append(kwargs["tags"])
-                kwargs["tags"] = tag_names
+        max_length = max(
+            inputs["input_ids"].shape[1], inputs["rejected_input_ids"].shape[1]
+        )
+        # Concatenate positive and negative inputs
+        concatenated_batch["input_ids"] = pad_to_length(
+            inputs["input_ids"], max_length, pad_token
+        )
+        concatenated_batch["rejected_input_ids"] = pad_to_length(
+            inputs["rejected_input_ids"], max_length, pad_token
+        )
+        concatenated_batch["labels"] = pad_to_length(
+            inputs["labels"], max_length, label_pad_token
+        )
+        concatenated_batch["rejected_labels"] = pad_to_length(
+            inputs["rejected_labels"], max_length, label_pad_token
+        )
+        concatenated_batch["attention_mask"] = pad_to_length(
+            inputs["attention_mask"], max_length, 0
+        )
+        concatenated_batch["rejected_attention_mask"] = pad_to_length(
+            inputs["rejected_attention_mask"], max_length, 0
+        )
+        concatenated_batch["prompt_attention_mask"] = pad_to_length(
+            inputs["prompt_attention_mask"], max_length, 0
+        ).to(device=device)
 
-        return kwargs
+        input_ids = torch.cat(
+            [concatenated_batch["input_ids"], concatenated_batch["rejected_input_ids"]],
+            dim=0,
+        ).to(device=device)
+        attention_mask = torch.cat(
+            [
+                concatenated_batch["attention_mask"],
+                concatenated_batch["rejected_attention_mask"],
+            ],
+            dim=0,
+        ).to(device=device)
+        labels = torch.cat(
+            [concatenated_batch["labels"], concatenated_batch["rejected_labels"]], dim=0
+        ).to(device=device)
+
+        return {
+            "input_ids": input_ids,
+            "labels": labels,
+            "attention_mask": attention_mask,
+            "prompt_attention_mask": concatenated_batch["prompt_attention_mask"],
+        }
+
+    def orpo_compute_custom_loss(self, logits, labels):
+        logits = logits.contiguous()
+        loss = 0.0
+
+        if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+
+            # Flatten the tokens
+            loss = self.loss_fct(shift_logits.transpose(2, 1), shift_labels).mean(
+                dim=-1
+            )
+
+        return loss
+
+    def orpo_compute_logps(
+        self, prompt_attention_mask, chosen_inputs, chosen_attention_mask, logits
+    ):
+        # Get the shape of chosen_attention_mask[:, :-1]
+        chosen_shape = chosen_attention_mask[:, :-1].shape
+
+        # Calculate the padding size
+        pad_length = chosen_shape[1] - (prompt_attention_mask.shape[1] - 1)
+
+        # Pad prompt_attention_mask with zeros to match the desired shape
+        prompt_attention_mask_padded = torch.nn.functional.pad(
+            prompt_attention_mask[:, 1:], (0, pad_length), mode="constant", value=0
+        )
+
+        # Perform the subtraction operation
+        mask = chosen_attention_mask[:, :-1] > prompt_attention_mask_padded
+
+        per_token_logps = torch.gather(
+            logits[:, :-1, :].log_softmax(-1),
+            dim=2,
+            index=(mask * chosen_inputs[:, 1:]).unsqueeze(2),
+        ).squeeze(2)
+        return torch.mul(per_token_logps, mask).sum(dim=1) / mask.sum(dim=1)
+
+    def orpo_compute_loss(self, model, inputs, return_outputs=False):
+        concat_inputs = AxolotlTrainer.orpo_concatenate_inputs(
+            inputs,
+            label_pad_token=-100,
+            pad_token=self.tokenizer.pad_token_id,
+            device=self.accelerator.device,
+        )
+
+        # Perform a single forward pass
+        outputs = model(
+            **{
+                "input_ids": concat_inputs["input_ids"],
+                "attention_mask": concat_inputs["attention_mask"],
+                "labels": concat_inputs["labels"],
+            },
+            output_hidden_states=True,
+        )
+
+        # Split the outputs for positive and negative examples
+        outputs_pos, outputs_neg = outputs.logits.chunk(2)
+
+        # Calculate NLL loss
+        pos_loss = self.orpo_compute_custom_loss(
+            logits=outputs_pos, labels=concat_inputs["input_ids"].chunk(2)[0]
+        )
+
+        # Calculate Log Probability
+        pos_prob = self.orpo_compute_logps(
+            prompt_attention_mask=concat_inputs["prompt_attention_mask"],
+            chosen_inputs=concat_inputs["input_ids"].chunk(2)[0],
+            chosen_attention_mask=concat_inputs["attention_mask"].chunk(2)[0],
+            logits=outputs_pos,
+        )
+        neg_prob = self.orpo_compute_logps(
+            prompt_attention_mask=concat_inputs["prompt_attention_mask"],
+            chosen_inputs=concat_inputs["input_ids"].chunk(2)[1],
+            chosen_attention_mask=concat_inputs["attention_mask"].chunk(2)[1],
+            logits=outputs_neg,
+        )
+
+        # Calculate log odds
+        log_odds = (pos_prob - neg_prob) - (
+            torch.log(1 - torch.exp(pos_prob)) - torch.log(1 - torch.exp(neg_prob))
+        )
+        sig_ratio = torch.nn.functional.sigmoid(log_odds)
+        ratio = torch.log(sig_ratio)
+
+        # Calculate the Final Loss
+        loss = torch.mean(pos_loss - self.args.orpo_alpha * ratio).to(
+            dtype=torch.bfloat16
+        )
+
+        metrics = {}
+        metrics["chosen_geometric_mean"] = torch.mean(pos_prob).cpu().item()
+        metrics["rejected_geometric_mean"] = torch.mean(neg_prob).cpu().item()
+        metrics["log_odds_ratio"] = torch.mean(ratio).cpu().item()
+        metrics["log_odds"] = torch.mean(log_odds).cpu().item()
+        self.store_metrics(metrics, train_eval="train")
+
+        return (loss, outputs_pos) if return_outputs else loss
 
     @wraps(Trainer.push_to_hub)
     def push_to_hub(self, *args, **kwargs) -> str:
@@ -351,11 +647,44 @@ class AxolotlTrainer(Trainer):
         Overwrite the `push_to_hub` method in order to force-add the tags when pushing the
         model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
         """
-        kwargs = self._sanitize_kwargs_for_tagging(
-            tag_names=self.tag_names, kwargs=kwargs
-        )
+        kwargs = _sanitize_kwargs_for_tagging(tag_names=self.tag_names, kwargs=kwargs)
 
         return super().push_to_hub(*args, **kwargs)
+
+    @wraps(Trainer.create_accelerator_and_postprocess)
+    def create_accelerator_and_postprocess(self):
+        res = super().create_accelerator_and_postprocess()
+
+        if self.is_fsdp_enabled:
+            if (
+                "limit_all_gathers" in self.args.fsdp_config
+                and self.args.fsdp_config["limit_all_gathers"]
+            ):
+                self.accelerator.state.fsdp_plugin.limit_all_gathers = True
+
+        return res
+
+    def log(self, logs: Dict[str, float]) -> None:
+        """
+        Log `logs` on the various objects watching training, including stored metrics.
+
+        Args:
+            logs (`Dict[str, float]`):
+                The values to log.
+        """
+        # logs either has 'loss' or 'eval_loss'
+        train_eval = "train" if "loss" in logs else "eval"
+        # Add averaged stored metrics to logs
+        for key, metrics in self._stored_metrics[train_eval].items():
+            logs[key] = torch.tensor(metrics).mean().item()
+        del self._stored_metrics[train_eval]
+        return super().log(logs)
+
+    def store_metrics(
+        self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train"
+    ) -> None:
+        for key, value in metrics.items():
+            self._stored_metrics[train_eval][key].append(value)
 
 
 class AxolotlMambaTrainer(AxolotlTrainer):
@@ -440,16 +769,55 @@ class ReLoRATrainer(AxolotlTrainer):
             warmup_steps = (
                 self.args.relora_warmup_steps if self.args.relora_warmup_steps else 10
             )
+            anneal_steps = (
+                self.args.relora_anneal_steps if self.args.relora_anneal_steps else 1
+            )
             self.lr_scheduler = ReLoRAScheduler(
                 optimizer,
                 lr_scheduler,
                 self.args.relora_steps,
+                anneal_steps,
                 warmup_steps,
             )
         else:
             self.lr_scheduler = lr_scheduler
 
         return self.lr_scheduler
+
+
+class AxolotlDPOTrainer(DPOTrainer):
+    """
+    Extend the base DPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "dpo"]
+
+    @wraps(DPOTrainer.push_to_hub)
+    def push_to_hub(self, *args, **kwargs) -> str:
+        """
+        Overwrite the `push_to_hub` method in order to force-add the tags when pushing the
+        model on the Hub. Please refer to `~transformers.Trainer.push_to_hub` for more details.
+        """
+        kwargs = _sanitize_kwargs_for_tagging(tag_names=self.tag_names, kwargs=kwargs)
+
+        return super().push_to_hub(*args, **kwargs)
+
+    def tokenize_row(
+        self, feature, model: Optional[Union[PreTrainedModel, torch.nn.Module]] = None
+    ) -> Dict:
+        res = super().tokenize_row(feature, model=model)
+        if self.tokenizer.bos_token_id is None and res["prompt_input_ids"][0] is None:
+            for key in res.keys():
+                res[key] = res[key][1:]
+        return res
+
+
+class AxolotlORPOTrainer(ORPOTrainer):
+    """
+    Extend the base ORPOTrainer for axolotl helpers
+    """
+
+    tag_names = ["axolotl", "orpo"]
 
 
 class TrainerBuilderBase(abc.ABC):
@@ -460,11 +828,18 @@ class TrainerBuilderBase(abc.ABC):
     _train_dataset = None
     _eval_dataset = None
     _model_ref = None
+    _peft_config = None
 
     def __init__(self, cfg, model, tokenizer):
         self.cfg = cfg
         self.model = model
         self.tokenizer = tokenizer
+
+        # in case the model supports tagging, add the axolotl tag.
+        # This makes sure the tag is correctly pushed even if a user calls
+        # model.push_to_hub instad of  trainer.push_to_hub.
+        if hasattr(model, "add_model_tags"):
+            model.add_model_tags(["axolotl"])
 
     @property
     def model_ref(self):
@@ -490,25 +865,32 @@ class TrainerBuilderBase(abc.ABC):
     def eval_dataset(self, dataset):
         self._eval_dataset = dataset
 
+    @property
+    def peft_config(self):
+        return self._peft_config
+
+    @peft_config.setter
+    def peft_config(self, peft_config):
+        self._peft_config = peft_config
+
     @abstractmethod
     def build(self, total_num_steps):
         pass
 
-    @abstractmethod
-    def get_callbacks(self):
-        pass
+    def get_callbacks(self) -> List[TrainerCallback]:
+        callbacks = []
+        if self.cfg.use_wandb:
+            callbacks.append(
+                SaveAxolotlConfigtoWandBCallback(self.cfg.axolotl_config_path)
+            )
+
+        return callbacks
 
     @abstractmethod
     def get_post_trainer_create_callbacks(self, trainer):
         """
         Callbacks added after the trainer is created, usually b/c these need access to the trainer
         """
-
-
-class HFCausalTrainerBuilder(TrainerBuilderBase):
-    """
-    Build the HuggingFace training args/trainer for Causal models
-    """
 
     def hook_pre_create_training_args(self, training_arguments_kwargs):
         # TODO
@@ -526,10 +908,16 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         # TODO
         return trainer
 
+
+class HFCausalTrainerBuilder(TrainerBuilderBase):
+    """
+    Build the HuggingFace training args/trainer for Causal models
+    """
+
     def get_callbacks(self):
-        callbacks = []
+        callbacks = super().get_callbacks()
         callbacks.append(GPUStatsCallback(self.cfg))
-        callbacks.append(EvalFirstStepCallback)
+        callbacks.append(EvalFirstStepCallback())
 
         if self.cfg.relora_steps:
             callbacks.append(ReLoRACallback(self.cfg))
@@ -538,11 +926,15 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             hasattr(self.model, "use_bettertransformer")
             and self.model.use_bettertransformer is True
         ):
-            callbacks.append(SaveBetterTransformerModelCallback)
+            callbacks.append(SaveBetterTransformerModelCallback())
 
-        if self.cfg.use_wandb:
+        if self.cfg.use_mlflow and is_mlflow_available():
+            from axolotl.utils.callbacks.mlflow_ import (
+                SaveAxolotlConfigtoMlflowCallback,
+            )
+
             callbacks.append(
-                SaveAxolotlConfigtoWandBCallback(self.cfg.axolotl_config_path)
+                SaveAxolotlConfigtoMlflowCallback(self.cfg.axolotl_config_path)
             )
 
         if self.cfg.loss_watchdog_threshold is not None:
@@ -554,12 +946,26 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         callbacks = []
         if self.cfg.use_wandb and self.cfg.eval_table_size > 0:
             LogPredictionCallback = log_prediction_callback_factory(
-                trainer, self.tokenizer
+                trainer, self.tokenizer, "wandb"
+            )
+            callbacks.append(LogPredictionCallback(self.cfg))
+        if (
+            self.cfg.use_mlflow
+            and is_mlflow_available()
+            and self.cfg.eval_table_size > 0
+        ):
+            LogPredictionCallback = log_prediction_callback_factory(
+                trainer, self.tokenizer, "mlflow"
             )
             callbacks.append(LogPredictionCallback(self.cfg))
 
         if self.cfg.do_bench_eval:
             callbacks.append(bench_eval_callback_factory(trainer, self.tokenizer))
+        if self.cfg.do_causal_lm_eval:
+            CausalLMBenchEvalCallback = causal_lm_bench_eval_callback_factory(
+                trainer, self.tokenizer
+            )
+            callbacks.append(CausalLMBenchEvalCallback(self.cfg))
 
         if self.cfg.early_stopping_patience:
             early_stop_cb = EarlyStoppingCallback(
@@ -567,6 +973,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             )
             callbacks.append(early_stop_cb)
 
+        if self.cfg.lisa_step_interval and self.cfg.lisa_n_layers:
+            callbacks.append(lisa_callback_factory(trainer))
         return callbacks
 
     def _get_trainer_cls(self):
@@ -614,18 +1022,17 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             training_arguments_kwargs[
                 "gradient_checkpointing"
             ] = self.cfg.gradient_checkpointing
-            if self.cfg.gradient_checkpointing_kwargs:
+            if self.cfg.gradient_checkpointing_kwargs is not None:
                 training_arguments_kwargs[
                     "gradient_checkpointing_kwargs"
                 ] = self.cfg.gradient_checkpointing_kwargs
-            else:
-                training_arguments_kwargs["gradient_checkpointing_kwargs"] = {
-                    "use_reentrant": False
-                }
         if self.cfg.fsdp:
             training_arguments_kwargs["fsdp"] = self.cfg.fsdp
             if self.cfg.fsdp_config:
                 training_arguments_kwargs["fsdp_config"] = dict(self.cfg.fsdp_config)
+
+        if self.cfg.adapter == "qlora":
+            training_arguments_kwargs["qlora"] = True
 
         # deepspeed
         if self.cfg.deepspeed:
@@ -681,7 +1088,12 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         elif self.cfg.sample_packing and self.cfg.eval_sample_packing is False:
             training_arguments_kwargs["dataloader_drop_last"] = True
 
-        if self.cfg.val_set_size == 0:
+        if self.cfg.remove_unused_columns is not None:
+            training_arguments_kwargs[
+                "remove_unused_columns"
+            ] = self.cfg.remove_unused_columns
+
+        if not self.cfg.test_datasets and self.cfg.val_set_size == 0:
             # no eval set, so don't eval
             training_arguments_kwargs["evaluation_strategy"] = "no"
         elif self.cfg.eval_steps:
@@ -708,6 +1120,8 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             training_arguments_kwargs["do_bench_eval"] = self.cfg.do_bench_eval
             if self.cfg.bench_dataset:
                 training_arguments_kwargs["bench_dataset"] = self.cfg.bench_dataset
+        if self.cfg.do_causal_lm_eval:
+            training_arguments_kwargs["do_causal_lm_eval"] = self.cfg.do_causal_lm_eval
         if self.cfg.metric_for_best_model:
             training_arguments_kwargs[
                 "metric_for_best_model"
@@ -747,9 +1161,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs[
             "per_device_train_batch_size"
         ] = self.cfg.micro_batch_size
-        training_arguments_kwargs[
-            "per_device_eval_batch_size"
-        ] = self.cfg.eval_batch_size
+        if self.cfg.eval_batch_size:
+            training_arguments_kwargs[
+                "per_device_eval_batch_size"
+            ] = self.cfg.eval_batch_size
         training_arguments_kwargs[
             "gradient_accumulation_steps"
         ] = self.cfg.gradient_accumulation_steps
@@ -767,7 +1182,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 self.cfg.load_best_model_at_end is not False
                 or self.cfg.early_stopping_patience
             )
-            and self.cfg.val_set_size > 0
+            and (
+                (not self.cfg.test_datasets and self.cfg.val_set_size > 0)
+                or (self.cfg.test_datasets and self.cfg.val_set_size == 0)
+            )
             and self.cfg.save_steps
             and self.cfg.eval_steps
             and self.cfg.save_steps % self.cfg.eval_steps == 0
@@ -788,6 +1206,22 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs["optim"] = (
             self.cfg.optimizer if self.cfg.optimizer else "adamw_hf"
         )
+        if self.cfg.optim_args:
+            if isinstance(self.cfg.optim_args, dict):
+                optim_args = ",".join(
+                    [f"{key}={value}" for key, value in self.cfg.optim_args.items()]
+                )
+            else:
+                optim_args = self.cfg.optim_args
+            training_arguments_kwargs["optim_args"] = optim_args
+        if self.cfg.optim_target_modules:
+            training_arguments_kwargs[
+                "optim_target_modules"
+            ] = self.cfg.optim_target_modules
+        training_arguments_kwargs["loraplus_lr_ratio"] = self.cfg.loraplus_lr_ratio
+        training_arguments_kwargs[
+            "loraplus_lr_embedding"
+        ] = self.cfg.loraplus_lr_embedding
         training_arguments_kwargs["lr_scheduler_type"] = (
             self.cfg.lr_scheduler
             if self.cfg.lr_scheduler
@@ -798,11 +1232,17 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             self.cfg.lr_scheduler_kwargs if self.cfg.lr_scheduler_kwargs else {}
         )
         training_arguments_kwargs["cosine_min_lr_ratio"] = self.cfg.cosine_min_lr_ratio
+        training_arguments_kwargs[
+            "cosine_constant_lr_ratio"
+        ] = self.cfg.cosine_constant_lr_ratio
         training_arguments_kwargs["weight_decay"] = (
             self.cfg.weight_decay if self.cfg.weight_decay is not None else 0.0
         )
         training_arguments_kwargs["sample_packing"] = (
             self.cfg.sample_packing if self.cfg.sample_packing else False
+        )
+        training_arguments_kwargs["multipack_real_batches"] = (
+            self.cfg.flash_attention is not True
         )
         training_arguments_kwargs["eval_sample_packing"] = (
             self.cfg.sample_packing
@@ -812,18 +1252,72 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         training_arguments_kwargs[
             "sample_packing_seq_len_multiplier"
         ] = self.cfg.micro_batch_size
-        training_arguments_kwargs["relora_steps"] = self.cfg.relora_steps
-        training_arguments_kwargs["relora_warmup_steps"] = self.cfg.relora_warmup_steps
+        if self.cfg.relora_steps:
+            training_arguments_kwargs["relora_steps"] = self.cfg.relora_steps
+            training_arguments_kwargs[
+                "relora_warmup_steps"
+            ] = self.cfg.relora_warmup_steps
+            if self.cfg.relora_anneal_steps:
+                training_arguments_kwargs[
+                    "relora_anneal_steps"
+                ] = self.cfg.relora_anneal_steps
+            if self.cfg.relora_prune_ratio:
+                training_arguments_kwargs[
+                    "relora_prune_ratio"
+                ] = self.cfg.relora_prune_ratio
+
+        if self.cfg.lisa_step_interval and self.cfg.lisa_n_layers:
+            training_arguments_kwargs["lisa_n_layers"] = self.cfg.lisa_n_layers
+            training_arguments_kwargs[
+                "lisa_step_interval"
+            ] = self.cfg.lisa_step_interval
+            training_arguments_kwargs[
+                "lisa_layers_attribute"
+            ] = self.cfg.lisa_layers_attribute
+
         training_arguments_kwargs = self.hook_pre_create_training_args(
             training_arguments_kwargs
         )
         training_arguments_kwargs["model_type"] = self.cfg.model_config_type
         training_arguments_kwargs["pretraining"] = bool(self.cfg.pretraining_dataset)
 
+        if self.cfg.rl == "orpo":
+            training_arguments_kwargs["orpo_alpha"] = self.cfg.orpo_alpha
+
         if self.cfg.neftune_noise_alpha is not None:
             training_arguments_kwargs[
                 "neftune_noise_alpha"
             ] = self.cfg.neftune_noise_alpha
+
+        trainer_kwargs = {}
+
+        if self.cfg.optimizer == "lion_pytorch":
+            from lion_pytorch import Lion
+
+            lion_kwargs = {"lr": training_arguments_kwargs["learning_rate"]}
+            if "weight_decay" in training_arguments_kwargs:
+                lion_kwargs["weight_decay"] = training_arguments_kwargs["weight_decay"]
+
+            if (
+                "adam_beta1" in training_arguments_kwargs
+                and "adam_beta2" in training_arguments_kwargs
+            ):
+                lion_kwargs["betas"] = (
+                    training_arguments_kwargs["adam_beta1"],
+                    training_arguments_kwargs["adam_beta2"],
+                )
+
+            trainer_kwargs["optimizers"] = (
+                Lion(params=self.model.parameters(), **lion_kwargs),
+                None,
+            )
+            # Set default so transformers doesn't throw
+            training_arguments_kwargs["optim"] = "adamw_hf"
+
+        if self.cfg.optimizer == "adamw_anyprecision":
+            if Path(self.cfg.torchdistx_path).exists():
+                sys.path.append(self.cfg.torchdistx_path)
+                importlib.import_module("torchdistx")
 
         training_args = (
             AxolotlTrainingArguments(  # pylint: disable=unexpected-keyword-arg
@@ -831,12 +1325,6 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
             )
         )
         training_args = self.hook_post_create_training_args(training_args)
-        trainer_kwargs = {}
-
-        if self.cfg.optimizer == "adamw_anyprecision":
-            if Path(self.cfg.torchdistx_path).exists():
-                sys.path.append(self.cfg.torchdistx_path)
-                importlib.import_module("torchdistx")
 
         data_collator_kwargs = {
             "padding": True,  # True/"longest" is the default
@@ -864,6 +1352,7 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collate_missing_features=self.cfg.collate_missing_features,
                 **data_collator_kwargs,
             ),
+            tokenizer=self.tokenizer,
             eval_data_collator=self.build_collator(
                 training_args,
                 is_eval=True,
@@ -925,16 +1414,40 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 collator,
                 ])
 
-        return collator
+        collator: Type[
+            Union[
+                V2BatchSamplerDataCollatorForSeq2Seq,
+                BatchSamplerDataCollatorForSeq2Seq,
+                DataCollatorForSeq2Seq,
+            ]
+        ]
+        if use_batch_sampler_collator:
+            if self.cfg.model_config_type in SUPPORTED_MULTIPACK_MODEL_TYPES:
+                collator = V2BatchSamplerDataCollatorForSeq2Seq
+            elif (
+                self.cfg.model_config_type in ["llama"]
+                and self.cfg.flash_attention is not True
+            ):
+                collator = V2BatchSamplerDataCollatorForSeq2Seq
+            else:
+                collator = BatchSamplerDataCollatorForSeq2Seq
+        else:
+            collator = DataCollatorForSeq2Seq
+
+        return collator(
+            self.tokenizer,
+            return_tensors="pt",
+            **kwargs,
+        )
 
 
-class HFDPOTrainerBuilder(TrainerBuilderBase):
+class HFRLTrainerBuilder(TrainerBuilderBase):
     """
     Trainer factory class for DPO Trainer
     """
 
     def get_callbacks(self):
-        callbacks = []
+        callbacks = super().get_callbacks()
         return callbacks
 
     def get_post_trainer_create_callbacks(self, trainer):
@@ -952,21 +1465,90 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
         ]:
             if hasattr(self.cfg, arg) and getattr(self.cfg, arg) is not None:
                 training_args_kwargs[arg] = getattr(self.cfg, arg)
-        training_args = TrainingArguments(
+
+        if self.cfg.hub_model_id:
+            training_args_kwargs["hub_model_id"] = self.cfg.hub_model_id
+            training_args_kwargs["push_to_hub"] = True
+            training_args_kwargs["hub_private_repo"] = True
+            training_args_kwargs["hub_always_push"] = True
+
+            if self.cfg.hub_strategy:
+                training_args_kwargs["hub_strategy"] = self.cfg.hub_strategy
+
+        if self.cfg.save_safetensors is not None:
+            training_args_kwargs["save_safetensors"] = self.cfg.save_safetensors
+
+        if self.eval_dataset:
+            training_args_kwargs["evaluation_strategy"] = "steps"
+            training_args_kwargs["eval_steps"] = self.cfg.eval_steps
+        else:
+            training_args_kwargs["evaluation_strategy"] = "no"
+        if self.cfg.bf16 or self.cfg.bfloat16:
+            training_args_kwargs["bf16"] = True
+
+        training_args_kwargs["lr_scheduler_type"] = (
+            self.cfg.lr_scheduler if self.cfg.lr_scheduler else "cosine"
+        )
+        training_args_kwargs["lr_scheduler_kwargs"] = (
+            self.cfg.lr_scheduler_kwargs if self.cfg.lr_scheduler_kwargs else {}
+        )
+        if self.cfg.remove_unused_columns is not None:
+            training_args_kwargs[
+                "remove_unused_columns"
+            ] = self.cfg.remove_unused_columns
+        else:
+            training_args_kwargs["remove_unused_columns"] = False
+
+        if self.cfg.dataloader_pin_memory is not None:
+            training_args_kwargs[
+                "dataloader_pin_memory"
+            ] = self.cfg.dataloader_pin_memory
+        if self.cfg.dataloader_num_workers is not None:
+            training_args_kwargs[
+                "dataloader_num_workers"
+            ] = self.cfg.dataloader_num_workers
+        if self.cfg.dataloader_prefetch_factor is not None:
+            training_args_kwargs[
+                "dataloader_prefetch_factor"
+            ] = self.cfg.dataloader_prefetch_factor
+        if self.cfg.gradient_checkpointing:
+            training_args_kwargs[
+                "gradient_checkpointing"
+            ] = self.cfg.gradient_checkpointing
+            if self.cfg.gradient_checkpointing_kwargs is not None:
+                training_args_kwargs[
+                    "gradient_checkpointing_kwargs"
+                ] = self.cfg.gradient_checkpointing_kwargs
+            else:
+                training_args_kwargs["gradient_checkpointing_kwargs"] = {
+                    "use_reentrant": False
+                }
+
+        # set save_strategy and save_steps
+        if self.cfg.save_steps:
+            training_args_kwargs["save_strategy"] = "steps"
+            training_args_kwargs["save_steps"] = self.cfg.save_steps
+        elif self.cfg.save_strategy:
+            training_args_kwargs["save_strategy"] = self.cfg.save_strategy
+        else:
+            # default to saving each epoch if not defined
+            training_args_kwargs["save_strategy"] = "epoch"
+
+        if self.cfg.orpo_alpha:
+            # trl does some odd mapping of alpha to beta to reuse the beta parameter ???
+            training_args_kwargs["beta"] = self.cfg.orpo_alpha
+
+        training_args_cls = TrainingArguments
+        if self.cfg.rl == "orpo":
+            training_args_cls = ORPOConfig
+
+        training_args = training_args_cls(
             per_device_train_batch_size=self.cfg.micro_batch_size,
-            max_steps=total_num_steps,
-            remove_unused_columns=False,
+            max_steps=self.cfg.max_steps or total_num_steps,
             gradient_accumulation_steps=self.cfg.gradient_accumulation_steps,
             learning_rate=self.cfg.learning_rate,
-            evaluation_strategy="no",
-            # eval_steps=self.cfg.eval_steps,
-            save_strategy="steps",
-            save_steps=self.cfg.save_steps,
             output_dir=self.cfg.output_dir,
             warmup_steps=self.cfg.warmup_steps,
-            bf16=True,
-            gradient_checkpointing=self.cfg.gradient_checkpointing,
-            gradient_checkpointing_kwargs={"use_reentrant": False},
             logging_first_step=True,
             logging_steps=1,
             optim=self.cfg.optimizer,
@@ -985,22 +1567,40 @@ class HFDPOTrainerBuilder(TrainerBuilderBase):
                 dpo_trainer_kwargs["label_smoothing"] = self.cfg.dpo_label_smoothing
         elif self.cfg.rl == "kto_pair":
             dpo_trainer_kwargs["loss_type"] = "kto_pair"
+        if self.eval_dataset:
+            dpo_trainer_kwargs["eval_dataset"] = self.eval_dataset
+        if self.cfg.adapter and self.peft_config:
+            dpo_trainer_kwargs["peft_config"] = self.peft_config
+        if self.cfg.precompute_ref_log_probs is not None:
+            dpo_trainer_kwargs[
+                "precompute_ref_log_probs"
+            ] = self.cfg.precompute_ref_log_probs
+        if self.cfg.rl in ["dpo", "ipo", "kto_pair"]:
+            trainer_cls = AxolotlDPOTrainer
+            dpo_trainer_kwargs["beta"] = self.cfg.dpo_beta or 0.1
+            trainer_cls_args = [self.model, self.model_ref]
 
-        dpo_trainer = DPOTrainer(
-            self.model,
-            self.model_ref,
+            # these aren't used for the ORPO trainer
+            dpo_trainer_kwargs["max_length"] = self.cfg.sequence_len
+            dpo_trainer_kwargs["max_target_length"] = None
+            dpo_trainer_kwargs["max_prompt_length"] = self.cfg.sequence_len
+            dpo_trainer_kwargs["generate_during_eval"] = True
+        elif self.cfg.rl == "orpo":
+            trainer_cls = AxolotlORPOTrainer
+            trainer_cls_args = [self.model]
+        else:
+            raise ValueError(f"Unsupported RL: {self.cfg.rl}")
+        dpo_trainer = trainer_cls(
+            *trainer_cls_args,
             args=training_args,
-            beta=self.cfg.dpo_beta or 0.1,
             train_dataset=self.train_dataset,
-            # eval_dataset=self.eval_dataset,
-            eval_dataset=None,
             tokenizer=self.tokenizer,
-            max_length=self.cfg.sequence_len,
-            max_target_length=None,
-            max_prompt_length=self.cfg.sequence_len,
-            generate_during_eval=True,
+            callbacks=self.get_callbacks(),
             **dpo_trainer_kwargs,
         )
+        dpo_trainer = self.hook_post_create_trainer(dpo_trainer)
+        for callback in self.get_post_trainer_create_callbacks(dpo_trainer):
+            dpo_trainer.add_callback(callback)
 
         return dpo_trainer
 
