@@ -405,46 +405,46 @@ class AxolotlTrainer(Trainer):
         return super().get_train_dataloader()
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
-        if self.args.sample_packing and self.args.eval_sample_packing is False:
-            self.data_collator = (  # pylint: disable=attribute-defined-outside-init
-                self.eval_data_collator
-            )
-            dataloader = super().get_eval_dataloader(eval_dataset)
-            self.data_collator = (  # pylint: disable=attribute-defined-outside-init
-                self.train_data_collator
-            )
-            return dataloader
+        # if self.args.sample_packing and self.args.eval_sample_packing is False:
+        #     self.data_collator = (  # pylint: disable=attribute-defined-outside-init
+        #         self.eval_data_collator
+        #     )
+        #     dataloader = super().get_eval_dataloader(eval_dataset)
+        #     self.data_collator = (  # pylint: disable=attribute-defined-outside-init
+        #         self.train_data_collator
+        #     )
+        #     return dataloader
 
-        if self.args.sample_packing and self.args.eval_sample_packing is not False:
-            eval_dataset = (
-                eval_dataset if eval_dataset is not None else self.eval_dataset
-            )
+        # if self.args.sample_packing and self.args.eval_sample_packing is not False:
+        #     eval_dataset = (
+        #         eval_dataset if eval_dataset is not None else self.eval_dataset
+        #     )
 
-            eval_sampler = self._get_eval_sampler(eval_dataset)
-            eval_dataset = eval_dataset.remove_columns(["length"])
-            data_collator = self.data_collator
-            dataloader_params = {
-                "batch_size": self.args.eval_batch_size,
-                "collate_fn": data_collator,
-                "num_workers": self.args.dataloader_num_workers,
-                "pin_memory": self.args.dataloader_pin_memory,
-            }
-            if self.args.dataloader_prefetch_factor:
-                dataloader_params[
-                    "prefetch_factor"
-                ] = self.args.dataloader_prefetch_factor
+        #     eval_sampler = self._get_eval_sampler(eval_dataset)
+        #     eval_dataset = eval_dataset.remove_columns(["length"])
+        #     data_collator = self.data_collator
+        #     dataloader_params = {
+        #         "batch_size": self.args.eval_batch_size,
+        #         "collate_fn": data_collator,
+        #         "num_workers": self.args.dataloader_num_workers,
+        #         "pin_memory": self.args.dataloader_pin_memory,
+        #     }
+        #     if self.args.dataloader_prefetch_factor:
+        #         dataloader_params[
+        #             "prefetch_factor"
+        #         ] = self.args.dataloader_prefetch_factor
 
-            if isinstance(eval_sampler, BatchSampler):
-                dataloader_params["batch_sampler"] = eval_sampler
-                del dataloader_params["batch_size"]
-            else:
-                dataloader_params["sampler"] = eval_sampler
-                dataloader_params["drop_last"] = self.args.dataloader_drop_last
+        #     if isinstance(eval_sampler, BatchSampler):
+        #         dataloader_params["batch_sampler"] = eval_sampler
+        #         del dataloader_params["batch_size"]
+        #     else:
+        #         dataloader_params["sampler"] = eval_sampler
+        #         dataloader_params["drop_last"] = self.args.dataloader_drop_last
 
-            self.accelerator.even_batches = False
-            return self.accelerator.prepare_data_loader(
-                DataLoader(eval_dataset, **dataloader_params)
-            )
+        #     self.accelerator.even_batches = False
+        #     return self.accelerator.prepare_data_loader(
+        #         DataLoader(eval_dataset, **dataloader_params)
+        #     )
 
         return super().get_eval_dataloader(eval_dataset)
 
@@ -1289,6 +1289,12 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
                 "neftune_noise_alpha"
             ] = self.cfg.neftune_noise_alpha
 
+        # print(f"WARNING: save_only_model is set to True.")
+        # training_arguments_kwargs['save_only_model'] = True
+
+        
+        # training_arguments_kwargs['evaluation_strategy'] = 'no'
+
         trainer_kwargs = {}
 
         if self.cfg.optimizer == "lion_pytorch":
@@ -1342,6 +1348,10 @@ class HFCausalTrainerBuilder(TrainerBuilderBase):
         trainer_kwargs, trainer_cls = self.hook_pre_create_trainer(
             trainer_kwargs, trainer_cls
         )
+
+        print("Trainer kwargs:", trainer_kwargs)
+        print("Trainer cls:", trainer_cls)
+
         trainer = trainer_cls(
             model=self.model,
             train_dataset=self.train_dataset,

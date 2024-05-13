@@ -585,6 +585,12 @@ def load_model(
         ):
             from transformers import LlamaForCausalLM
 
+            # print('This is what is going into the loading...')
+            # print(model_config)
+            # print(model_kwargs)
+            
+            # model_kwargs['device_map']= 'auto'
+
             model = LlamaForCausalLM.from_pretrained(
                 base_model,
                 config=model_config,

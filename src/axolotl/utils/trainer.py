@@ -195,6 +195,7 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
         if "length" in train_dataset.data.column_names:
             total_num_tokens = np.sum(train_dataset.data["length"])
         else:
+            print('This might be slow...')
             total_num_tokens = np.sum(
                 train_dataset.data.column("input_ids")
                 .to_pandas()
@@ -207,26 +208,26 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
 
     skip_estimates = cfg.model_config_type == "mamba"
 
-    if not skip_estimates and not cfg.total_supervised_tokens:
-        if "labels" in train_dataset.data.column_names:
-            total_supervised_tokens = (
-                train_dataset.data.column("labels")
-                .to_pandas()
-                .apply(lambda x: np.sum(np.array(x) != -100))
-                .sum()
-            )
-        else:
-            LOG.debug(
-                "Dataset does not contain labels, assuming all tokens are supervised"
-            )
-            total_supervised_tokens = cfg.total_num_tokens
+    # if not skip_estimates and not cfg.total_supervised_tokens:
+    #     if "labels" in train_dataset.data.column_names:
+    #         total_supervised_tokens = (
+    #             train_dataset.data.column("labels")
+    #             .to_pandas()
+    #             .apply(lambda x: np.sum(np.array(x) != -100))
+    #             .sum()
+    #         )
+    #     else:
+    #         LOG.debug(
+    #             "Dataset does not contain labels, assuming all tokens are supervised"
+    #         )
+    #         total_supervised_tokens = cfg.total_num_tokens
 
-        LOG.debug(
-            f"`total_supervised_tokens: {total_supervised_tokens:_}`",
-            main_process_only=True,
-        )
-        if update:
-            cfg.total_supervised_tokens = total_supervised_tokens
+    #     LOG.debug(
+    #         f"`total_supervised_tokens: {total_supervised_tokens:_}`",
+    #         main_process_only=True,
+    #     )
+    #     if update:
+    #         cfg.total_supervised_tokens = total_supervised_tokens
 
     if not skip_estimates and cfg.sample_packing:
         # we have to drop anything longer then sequence len otherwise
@@ -304,6 +305,13 @@ def calculate_total_num_steps(cfg, train_dataset, update=True):
                 / cfg.batch_size
             )
         )
+
+        print(f"total_num_steps: {total_num_steps}")
+        print(f"len(train_dataset): {len(train_dataset)}")
+        print(f"cfg.num_epochs: {cfg.num_epochs}")
+        print(f"os.environ.get('WORLD_SIZE', 1): {os.environ.get('WORLD_SIZE', 1)}")
+        print(f"cfg.batch_size: {cfg.batch_size}")
+        print('-------------------')
     LOG.debug(f"total_num_steps: {total_num_steps}", main_process_only=True)
     return total_num_steps
 

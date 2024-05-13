@@ -146,7 +146,7 @@ class BatchSamplerDataCollatorForSeq2Seq(DataCollatorForSeq2Seq):
         out_features = [{} for _ in features]
         for i, features_ in enumerate(features):
             for feature in features_[0].keys():
-                if feature == "length":
+                if feature == "length" or feature == "mask_id":
                     continue
                 if feature == "attention_mask":
                     arrays = [
@@ -224,7 +224,11 @@ class MissingFeaturesCollator:
         for item in features:
             n = len(item['input_ids'])
             if collate_labels and 'labels' not in item:
-                item['labels'] = item['input_ids'][:]
+                labels = item['input_ids'][:]
+                if 'mask_id' in item:
+                   mask_id = item.pop('mask_id')
+                   labels[mask_id:] = -IGNORE_INDEX
+                item['labels'] = labels
             if collate_position_ids and 'position_ids' not in item:
                 item['position_ids'] = [i for i in range(n)]
             if collate_attention_mask and 'attention_mask' not in item:
